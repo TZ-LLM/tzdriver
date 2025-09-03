@@ -45,6 +45,7 @@ struct pages_module_result {
 };
 
 struct pages_module_result g_mem_info = {0};
+struct pages_module_result g_mem_info2 = {0};
 
 static int tee_pages_register_core(void)
 {
@@ -62,6 +63,24 @@ static int tee_pages_register_core(void)
 		return -1;
 	}
 	g_mem_info.log_len = PAGES_LOG_MEM_LEN;
+	return 0;
+}
+static int tee_pages_register_core2(void)
+{
+	if (g_mem_info2.log_addr != 0 || g_mem_info2.log_len != 0) {
+		if (memset_s((void *)g_mem_info2.log_addr,  g_mem_info2.log_len, 0,  g_mem_info2.log_len) != 0) {
+			tloge("clean llamaout memory failed\n");
+			return -EFAULT;
+		}
+		return 0;
+	}
+
+	g_mem_info2.log_addr = get_llamaout_mem_vaddr();
+	if (IS_ERR_OR_NULL((void *)(uintptr_t)g_mem_info2.log_addr)) {
+		tloge("get llamaout mem error\n");
+		return -1;
+	}
+	g_mem_info2.log_len = 4096;
 	return 0;
 }
 
@@ -90,6 +109,32 @@ int register_log_mem(uint64_t *addr, uint32_t *len)
 
 	*addr = g_mem_info.log_addr;
 	*len = g_mem_info.log_len;
+	return ret;
+}
+int register_llamaout_mem(uint64_t *addr, uint32_t *len)
+{
+	int ret;
+	uint64_t mem_addr;
+	uint32_t mem_len;
+
+	if (!addr || !len) {
+		tloge("addr or len is invalid\n");
+		return -1;
+	}
+
+	ret = tee_pages_register_core2();
+	if (ret != 0)
+		return ret;
+
+	mem_addr = get_log_mem_paddr(g_mem_info2.log_addr); // reuse, have risk!
+	mem_len = g_mem_info2.log_len;
+
+	ret = register_mem_to_teeos2(mem_addr, mem_len, true);
+	if (ret != 0)
+		return ret;
+
+	*addr = g_mem_info2.log_addr;
+	*len = g_mem_info2.log_len;
 	return ret;
 }
 

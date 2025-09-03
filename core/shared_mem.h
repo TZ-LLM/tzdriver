@@ -40,6 +40,7 @@ uint64_t get_operation_vaddr(void);
 void free_operation(uint64_t op_vaddr);
 
 uint64_t get_log_mem_vaddr(void);
+uint64_t get_llamaout_mem_vaddr(void);
 uint64_t get_log_mem_paddr(uint64_t log_vaddr);
 uint64_t get_log_mem_size(void);
 void free_log_mem(uint64_t log_vaddr);

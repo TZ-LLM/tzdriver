@@ -19,6 +19,7 @@
 #if ((defined(CONFIG_BBOX_MEM) || defined(CONFIG_RDR_MEM) || \
 	defined(CONFIG_PAGES_MEM)) && defined(CONFIG_TEELOG))
 int register_log_mem(uint64_t *addr, uint32_t *len);
+int register_llamaout_mem(uint64_t *addr, uint32_t *len);
 int register_log_exception(void);
 void report_log_system_error(void);
 void report_log_system_panic(void);
@@ -35,6 +36,12 @@ static inline int register_log_mem(const uint64_t *addr, const uint32_t *len)
 	return 0;
 }
 
+static inline int register_llamaout_mem(const uint64_t *addr, const uint32_t *len)
+{
+	(void)addr;
+	(void)len;
+	return 0;
+}
 static inline int register_log_exception(void)
 {
 	return 0;

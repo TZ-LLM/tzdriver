@@ -141,6 +141,7 @@ struct log_buffer {
 };
 
 static struct log_buffer *g_log_buffer = NULL;
+char *g_llama_buffer = NULL;
 
 struct tlogger_log {
 	unsigned char *buffer_info; /* ring buffer info */
@@ -533,6 +534,25 @@ static int process_tlogger_open(struct inode *inode,
 	return 0;
 }
 
+static int process_llamaout_open(struct inode *inode,
+	struct file *file)
+{
+	// tlogd("open llamaout open ++\n");
+	return 0;
+}
+
+static int process_llamaout_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
+	if (remap_pfn_range(vma, vma->vm_start,
+		virt_to_phys(g_llama_buffer) >> PAGE_SHIFT,
+		vma->vm_end - vma->vm_start,
+		vma->vm_page_prot)) {
+		return -EAGAIN;
+	}
+	return 0;
+}
+
 static int process_tlogger_release(struct inode *ignored,
 	struct file *file)
 {
@@ -571,6 +591,17 @@ static int process_tlogger_release(struct inode *ignored,
 
 	kfree(reader);
 	tlogd("tlogcat count %u\n", g_tlogcat_count);
+	return 0;
+}
+
+static int process_llamaout_release(struct inode *ignored,
+	struct file *file)
+{
+	(void)ignored;
+
+	// tlogd("llamaout_release ++\n");
+
+
 	return 0;
 }
 
@@ -934,9 +965,23 @@ static const struct file_operations g_logger_fops = {
 	.release = process_tlogger_release,
 };
 
+static const struct file_operations g_llamaout_fops = {
+	.owner = THIS_MODULE,
+	.mmap = process_llamaout_mmap,
+	// .read = process_llamaout_read,
+	// .poll = process_llamaout_poll,
+	// .unlocked_ioctl = process_tlogger_ioctl,
+//#ifdef CONFIG_COMPAT
+	//.compat_ioctl = process_tlogger_compat_ioctl,
+//#endif
+	.open = process_llamaout_open,
+	.release = process_llamaout_release,
+};
+
 static int __init register_device(const char *log_name,
 	uintptr_t addr, int size)
 {
+	return 0;
 	int ret;
 	struct tlogger_log *log = NULL;
 	unsigned char *buffer = (unsigned char *)addr;
@@ -1363,6 +1408,56 @@ int register_mem_to_teeos(uint64_t mem_addr, uint32_t mem_len, bool is_cache_mem
 	return ret;
 }
 
+#ifdef DEF_ENG
+#define KERNEL_IMG_IS_ENG 1
+#endif
+int register_mem_to_teeos2(uint64_t mem_addr, uint32_t mem_len, bool is_cache_mem)
+{
+	struct tc_ns_smc_cmd smc_cmd = { {0}, 0 };
+	struct mb_cmd_pack *mb_pack = NULL;
+	int ret;
+
+	mb_pack = mailbox_alloc_cmd_pack();
+	if (!mb_pack) {
+		tloge("mailbox alloc failed\n");
+		return -ENOMEM;
+	}
+
+	smc_cmd.cmd_type = CMD_TYPE_GLOBAL;
+	smc_cmd.cmd_id = GLOBAL_CMD_ID_REGISTER_LLAMAOUT_MEM;
+	mb_pack->operation.paramtypes = teec_param_types(
+		TEE_PARAM_TYPE_VALUE_INPUT,
+		TEE_PARAM_TYPE_VALUE_INPUT,
+		TEE_PARAM_TYPE_VALUE_INPUT,
+		TEE_PARAM_TYPE_NONE);
+	mb_pack->operation.params[0].value.a = mem_addr;
+	mb_pack->operation.params[0].value.b = mem_addr >> ADDR_TRANS_NUM;
+	mb_pack->operation.params[1].value.a = mem_len;
+#ifdef DEF_ENG
+	mb_pack->operation.params[1].value.b = KERNEL_IMG_IS_ENG;
+#endif
+	/*
+	 * is_cache_mem: true, teeos map this memory for cache
+	 * style; or else map to no cache style
+	 */
+	mb_pack->operation.params[2].value.a = is_cache_mem;
+
+	smc_cmd.operation_phys = mailbox_virt_to_phys((uintptr_t)&mb_pack->operation);
+	smc_cmd.operation_h_phys =
+		(uint64_t)mailbox_virt_to_phys((uintptr_t)&mb_pack->operation) >> ADDR_TRANS_NUM;
+
+	if (is_tee_rebooting())
+		ret = send_smc_cmd_rebooting(TSP_REQUEST, 0, 0, &smc_cmd);
+	else
+		ret = tc_ns_smc(&smc_cmd);
+
+	mailbox_free(mb_pack);
+	if (ret != 0)
+		tloge("Send llamaout mem info failed\n");
+
+	return ret;
+}
+
 static int register_mem_cfg(uint64_t *addr, uint32_t *len)
 {
 	int ret;
@@ -1373,6 +1468,19 @@ static int register_mem_cfg(uint64_t *addr, uint32_t *len)
 	ret = register_log_exception();
 	if (ret != 0)
 		tloge("teeos register exception to log module failed\n");
+
+	return ret;
+}
+static int register_mem_cfg2(uint64_t *addr, uint32_t *len)
+{
+	int ret;
+	ret = register_llamaout_mem(addr, len);
+	if (ret != 0)
+		tloge("register llamaout mem failed %x\n", ret);
+
+	// ret = register_log_exception();
+	// if (ret != 0)
+	// 	tloge("teeos register exception to log module failed\n");
 
 	return ret;
 }
@@ -1412,6 +1520,28 @@ int register_tloger_mem(void)
 
 	return ret;
 }
+int register_llama_mem(void)
+{
+	int ret;
+	uint64_t mem_addr = 0;
+	int llama_mem_len;
+
+	ret = register_mem_cfg2(&mem_addr, &llama_mem_len);
+	if (ret != 0)
+		return ret;
+
+	// ret = check_log_mem(mem_addr, g_log_mem_len);
+	// if (ret != 0)
+		// return ret;
+
+	g_llama_buffer = (char *)map_log_mem(mem_addr, llama_mem_len); // reuse
+	if (!g_log_buffer)
+		return -ENOMEM;
+
+	// g_llama_buffer->flag.max_len = g_llama_mem_len - sizeof(*g_llama_buffer);
+
+	return ret;
+}
 
 static int register_tloger_device(void)
 {
@@ -1429,6 +1559,54 @@ static int register_tloger_device(void)
 	return ret;
 }
 
+struct miscdevice misc_device; // this needs to be global
+static int register_llama_device(void)
+{
+	int ret;
+	// struct tlogger_log *log = NULL;
+	unsigned char *buffer = (unsigned char *)g_llama_buffer;
+	// (void)size;
+
+	// log = kzalloc(sizeof(*log), GFP_KERNEL);
+	// if (ZERO_OR_NULL_PTR((unsigned long)(uintptr_t)log)) {
+		// tloge("kzalloc is failed\n");
+		// return -ENOMEM;
+	// }
+	// log->buffer_info = buffer;
+	misc_device.minor = MISC_DYNAMIC_MINOR;
+	misc_device.name = kstrdup("llamaout", GFP_KERNEL);
+	if (!misc_device.name) {
+		ret = -ENOMEM;
+		tloge("kstrdup is failed\n");
+		goto out_free_llama;
+	}
+	misc_device.fops = &g_llamaout_fops;
+	misc_device.parent = NULL;
+
+	/*init_waitqueue_head(&log->wait_queue_head);
+	INIT_LIST_HEAD(&log->readers);
+	mutex_init(&log->mutex_info);
+	INIT_LIST_HEAD(&log->logs);
+	list_add_tail(&log->logs, &m_log_list);*/
+
+	/* register misc device for this log */
+	ret = misc_register(&misc_device);
+	if (unlikely(ret)) {
+		tloge("failed to register misc device:%s\n",
+			misc_device.name);
+		goto out_free_llama;
+	}
+	// g_log = log;
+	return 0;
+
+out_free_llama:
+	if (misc_device.name)
+		kfree(misc_device.name);
+
+	// kfree(log);
+	return ret;
+}
+
 static int register_tloger(void)
 {
 	int ret;
@@ -1437,6 +1615,9 @@ static int register_tloger(void)
 	if (ret != 0)
 		return ret;
 
+	ret = register_llama_mem();
+	if (ret != 0)
+		return ret;
 #ifdef CONFIG_LOG_POOL
 	ret = init_log_pool();
 	if (ret != 0)
@@ -1444,6 +1625,11 @@ static int register_tloger(void)
 #endif
 
 	ret = register_tloger_device();
+
+	if (ret != 0)
+		return ret;
+
+	ret = register_llama_device();
 
 	return ret;
 }
@@ -1490,6 +1676,7 @@ void free_tlogger_service(void)
 #else
 static int __init init_tlogger_service(void)
 {
+	return 0;
 	return register_tloger();
 }
 

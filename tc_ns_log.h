@@ -31,7 +31,7 @@ enum {
 };
 #define MOD_TEE "tzdriver"
 
-#define TEE_LOG_MASK TZ_DEBUG_INFO
+#define TEE_LOG_MASK TZ_DEBUG_VERBOSE
 
 #define tlogv(fmt, args...) \
 do { \

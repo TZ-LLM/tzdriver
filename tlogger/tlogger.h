@@ -33,6 +33,7 @@
 void tz_log_write(void);
 int tlogger_store_msg(const char *file_path, uint32_t file_path_len);
 int register_mem_to_teeos(uint64_t mem_addr, uint32_t mem_len, bool is_cache_mem);
+int register_mem_to_teeos2(uint64_t mem_addr, uint32_t mem_len, bool is_cache_mem);
 
 #ifdef CONFIG_TZDRIVER_MODULE
 int init_tlogger_service(void);
@@ -53,6 +54,13 @@ static inline int tlogger_store_msg(const char *file_path, uint32_t file_path_le
 	return 0;
 }
 static inline int register_mem_to_teeos(uint64_t mem_addr, uint32_t mem_len,
+	bool is_cache_mem)
+{
+	(void)mem_addr;
+	(void)mem_len;
+	return 0;
+}
+static inline int register_mem_to_teeos2(uint64_t mem_addr, uint32_t mem_len,
 	bool is_cache_mem)
 {
 	(void)mem_addr;

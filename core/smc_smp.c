@@ -77,6 +77,7 @@
 #include "smc_hook.h"
 #endif
 #include "smc_call.h"
+#include "smc_abi.h"
 
 #define PREEMPT_COUNT		10000
 #define HZ_COUNT			10
@@ -153,25 +154,6 @@ static DECLARE_WAIT_QUEUE_HEAD(ipi_th_wait);
 static atomic_t g_siq_th_run;
 static uint32_t g_siq_queue[MAX_SIQ_NUM];
 DEFINE_MUTEX(g_siq_lock);
-
-enum smc_ops_exit {
-	SMC_OPS_NORMAL   	= 0x0,
-	SMC_OPS_SCHEDTO     	= 0x1,
-	SMC_OPS_START_SHADOW	= 0x2,
-	SMC_OPS_START_FIQSHD	= 0x3,
-	SMC_OPS_PROBE_ALIVE	= 0x4,
-	SMC_OPS_ABORT_TASK	= 0x5,
-	SMC_EXIT_NORMAL		= 0x0,
-	SMC_EXIT_PREEMPTED	= 0x1,
-	SMC_EXIT_SHADOW		= 0x2,
-	SMC_EXIT_ABORT		= 0x3,
-#ifdef CONFIG_THIRDPARTY_COMPATIBLE
-	SMC_EXIT_CRASH          = 0x4,
-	SMC_EXIT_MAX            = 0x5,
-#else
-	SMC_EXIT_MAX		= 0x4,
-#endif
-};
 
 #define SHADOW_EXIT_RUN			 	0x1234dead
 #define SMC_EXIT_TARGET_SHADOW_EXIT 0x1
@@ -1866,9 +1848,28 @@ int tc_ns_smc_with_no_nr(struct tc_ns_smc_cmd *cmd)
 	return proc_tc_ns_smc(cmd, true);
 }
 
-static void smc_work_no_wait(uint32_t type)
+static void send_smc_cmd_with_retry(struct smc_in_params *in_param,
+	struct smc_out_params *out_param)
 {
-	(void) raw_smc_send(TSP_REQUEST, g_cmd_phys, type, true);
+#if (CONFIG_CPU_AFF_NR != 0)
+	struct cpumask old_mask;
+	set_cpu_strategy(&old_mask);
+#endif
+
+retry:
+	send_asm_smc_cmd(in_param, out_param);
+
+	if (out_param->exit_reason == SMC_EXIT_PREEMPTED
+		&& out_param->ret == TSP_RESPONSE) {
+#if (!defined(CONFIG_PREEMPT)) || defined(CONFIG_RTOS_PREEMPT_OFF)
+		cond_resched();
+#endif
+		in_param->x1 = SMC_OPS_SCHEDTO;
+		goto retry;
+	}
+#if (CONFIG_CPU_AFF_NR != 0)
+	restore_cpu(&old_mask);
+#endif
 }
 
 void send_smc_reset_cmd_buffer(void)
@@ -1879,7 +1880,11 @@ void send_smc_reset_cmd_buffer(void)
 static void smc_work_set_cmd_buffer(struct work_struct *work)
 {
 	(void)work;
-	smc_work_no_wait(TC_NS_CMD_TYPE_SECURE_CONFIG);
+	struct smc_in_params in_param = {TSP_REQUEST, g_cmd_phys, TC_NS_CMD_TYPE_SECURE_CONFIG,
+		g_cmd_phys >> ADDR_TRANS_NUM};
+	struct smc_out_params out_param = {0};
+
+	send_smc_cmd_with_retry(&in_param, &out_param);
 }
 
 void smc_set_cmd_buffer(void)

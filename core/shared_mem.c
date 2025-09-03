@@ -285,7 +285,7 @@ uintptr_t mailbox_page_address(mailbox_page_t *page)
 	if (!page)
 		return 0;
 
-	return page_address(page);
+	return (uintptr_t)page_address(page);
 }
 
 uintptr_t mailbox_virt_to_phys(uintptr_t addr)
@@ -293,7 +293,7 @@ uintptr_t mailbox_virt_to_phys(uintptr_t addr)
 	if (!addr)
 		return 0;
 
-	return virt_to_phys(addr);
+	return virt_to_phys((const volatile void *)addr);
 }
 
 mailbox_page_t *mailbox_virt_to_page(uint64_t ptr)
@@ -306,7 +306,7 @@ mailbox_page_t *mailbox_virt_to_page(uint64_t ptr)
 
 uint64_t get_operation_vaddr(void)
 {
-	return kzalloc(sizeof(struct tc_ns_operation), GFP_KERNEL);
+	return (uint64_t)kzalloc(sizeof(struct tc_ns_operation), GFP_KERNEL);
 }
 
 void free_operation(uint64_t op_vaddr)
@@ -314,12 +314,16 @@ void free_operation(uint64_t op_vaddr)
 	if (!op_vaddr)
 		return;
 
-	kfree(op_vaddr);
+	kfree((const void *)op_vaddr);
 }
 
 uint64_t get_log_mem_vaddr(void)
 {
 	return __get_free_pages(GFP_KERNEL | __GFP_ZERO, get_order(PAGES_LOG_MEM_LEN));
+}
+uint64_t get_llamaout_mem_vaddr(void)
+{
+	return __get_free_pages(GFP_KERNEL | __GFP_ZERO, get_order(4096));
 }
 
 uint64_t get_log_mem_paddr(uint64_t log_vaddr)

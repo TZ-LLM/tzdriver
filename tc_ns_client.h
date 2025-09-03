@@ -42,6 +42,17 @@
 #define mm_sem_lock(mm) (mm)->mmap_sem
 #endif
 
+// struct llm_client_op_pages {
+// 	unsigned long entry_begin;
+// 	unsigned long entry_end;
+// };
+
+struct llm_client_op_pages {
+	int cma_index;
+	int entry_index;
+	unsigned long size;
+};
+
 struct tc_ns_client_login {
 	__u32 method;
 	__u32 mdata;
@@ -194,4 +205,18 @@ struct tc_ns_log_pool {
 #define TC_NS_CLIENT_IOCTL_GET_LOG_POOL \
 	_IOWR(TC_NS_CLIENT_IOC_MAGIC, 23, struct tc_ns_log_pool)
 #endif
+#define LLM_CLIENT_IOCTL_RUN \
+	_IOWR(TC_NS_CLIENT_IOC_MAGIC, 24, int)
+#define LLM_CLIENT_IOCTL_PUSH_PAGES \
+	_IOWR(TC_NS_CLIENT_IOC_MAGIC, 25, struct llm_client_op_pages)
+#define LLM_CLIENT_IOCTL_POP_PAGES \
+	_IOWR(TC_NS_CLIENT_IOC_MAGIC, 26, struct llm_client_op_pages)
+#define LLM_CLIENT_IOCTL_SET_PAGES \
+	_IOWR(TC_NS_CLIENT_IOC_MAGIC, 27, struct llm_client_op_pages)
+#define LLM_CLIENT_IOCTL_RKNPU_ATTACH \
+	_IOWR(TC_NS_CLIENT_IOC_MAGIC, 28, int)
+#define LLM_CLIENT_IOCTL_RKNPU_DETACH \
+	_IOWR(TC_NS_CLIENT_IOC_MAGIC, 29, int)
+#define LLM_CLIENT_IOCTL_PUSH_PAGES_WITH_INDEX \
+	_IOWR(TC_NS_CLIENT_IOC_MAGIC, 30, struct llm_client_op_pages)
 #endif

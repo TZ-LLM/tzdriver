@@ -54,6 +54,8 @@
 #include <linux/acpi.h>
 #include <linux/completion.h>
 #include <linux/bitmap.h>
+#include <linux/cma.h>
+#include <linux/atomic.h>
 #include <securec.h>
 #include "smc_smp.h"
 #include "teek_client_constants.h"
@@ -87,6 +89,321 @@
 #ifdef CONFIG_FFA_SUPPORT
 #include "ffa_abi.h"
 #endif
+
+#include "smc_abi.h"
+
+#define CMD_QUEUE_SHM_SIZE (256 * 4096)
+static unsigned long g_llm_shm;
+
+#define MAX_ORDER (10)
+
+#define TZASC_NR               (4)
+#define TZASC_TOTAL_MEM_SIZE   (9UL * (1UL << 30))
+#define TZASC_PER_CMA_MEM_SIZE (TZASC_TOTAL_MEM_SIZE / TZASC_NR)
+
+struct tzasc_cma_entry {
+	unsigned long paddr;
+	unsigned long size;
+	struct page *cma_pages;
+};
+
+struct tzasc_cma_meta {
+	unsigned long base;
+	unsigned long size;
+	unsigned long count;
+	struct tzasc_cma_entry entry[((PAGE_SIZE << MAX_ORDER) / TZASC_NR - sizeof(unsigned long) * 4) / sizeof(struct tzasc_cma_entry)];
+};
+
+extern struct cma *tzasc_cma[TZASC_NR];
+struct tzasc_cma_meta *g_tzasc_cma_meta_arr;
+static spinlock_t tzasc_cma_lock;
+
+struct page *tzasc_cma_alloc_with_index(int cma_index, unsigned long size) {
+	if (cma_index < 0 || cma_index >= TZASC_NR)
+		return NULL;
+	return cma_alloc(tzasc_cma[cma_index], size >> PAGE_SHIFT, 0, GFP_KERNEL);
+}
+
+int tzasc_cma_free_with_index(int cma_index, struct page *cma_pages, unsigned long size) {
+	if (cma_index < 0 || cma_index >= TZASC_NR)
+		return -EINVAL;
+	bool ret = cma_release(tzasc_cma[cma_index], cma_pages, size >> PAGE_SHIFT);
+	if (ret)
+		return 0;
+	else
+		return -EINVAL;
+}
+
+int tzasc_cma_push_pages_with_index(unsigned long size, int cma_index) {
+	int ret;
+	unsigned long flags;
+	struct tzasc_cma_meta *g_tzasc_cma_meta = g_tzasc_cma_meta_arr + cma_index;
+
+	if (cma_index < 0 || cma_index >= TZASC_NR)
+		return -EINVAL;
+
+	size = (size + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE;
+	struct tzasc_cma_entry *entry = &g_tzasc_cma_meta->entry[g_tzasc_cma_meta->count];
+	entry->cma_pages = tzasc_cma_alloc_with_index(cma_index, size);
+	if (entry->cma_pages == NULL) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	entry->paddr = page_to_phys(entry->cma_pages);
+	entry->size = size;
+	// pr_info("%s %d: size %lx count %d\n", __func__, __LINE__, size, g_tzasc_cma_meta->count);
+	ret = g_tzasc_cma_meta->count++;
+
+out:
+	return ret;
+}
+
+int tzasc_cma_pop_pages_with_index(int cma_index) {
+	int ret;
+	unsigned long flags;
+	struct tzasc_cma_meta *g_tzasc_cma_meta = g_tzasc_cma_meta_arr + cma_index;
+
+	if (cma_index < 0 || cma_index >= TZASC_NR)
+		return -EINVAL;
+
+	if (g_tzasc_cma_meta->count == 0) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	g_tzasc_cma_meta->count--;
+	struct tzasc_cma_entry *entry = &g_tzasc_cma_meta->entry[g_tzasc_cma_meta->count];
+	// pr_info("%s %d: size %lx count %d\n", __func__, __LINE__, g_tzasc_cma_meta->entry[g_tzasc_cma_meta->count].size, g_tzasc_cma_meta->count);
+	ret = tzasc_cma_free_with_index(cma_index, entry->cma_pages, entry->size);
+
+out:
+	return ret;
+}
+
+void tzasc_cma_free_pages_with_index(int cma_index) {
+	struct tzasc_cma_meta *g_tzasc_cma_meta = g_tzasc_cma_meta_arr + cma_index;
+
+	if (cma_index < 0 || cma_index >= TZASC_NR)
+		return;
+	while (g_tzasc_cma_meta->count)
+		tzasc_cma_pop_pages_with_index(cma_index);
+}
+
+static int cur_cma_index = 0;
+
+int tzasc_cma_push_pages(unsigned long size) {
+	int ret = -EINVAL;
+
+	for (; cur_cma_index < TZASC_NR; cur_cma_index++) {
+		ret = tzasc_cma_push_pages_with_index(size, cur_cma_index);
+		if (ret != -ENOMEM)
+			break;
+	}
+
+	return ret;
+}
+
+int tzasc_cma_pop_pages(void) {
+	int ret = -EINVAL;
+
+	for (; cur_cma_index >= 0; cur_cma_index--) {
+		ret = tzasc_cma_pop_pages_with_index(cur_cma_index);
+		if (ret != -ENOMEM)
+			break;
+	}
+
+	return ret;
+}
+
+void tzasc_cma_free_pages(void) {
+	int cma_index;
+	for (cma_index = 0; cma_index < TZASC_NR; cma_index++) {
+		tzasc_cma_free_pages_with_index(cma_index);
+	}
+	cur_cma_index = 0;
+}
+
+int tzasc_cma_init(void) {
+	int cma_index;
+	struct tzasc_cma_meta *g_tzasc_cma_meta;
+
+	spin_lock_init(&tzasc_cma_lock);
+	tlogd("%s: meta size %lu, mem size %lu\n", __func__, sizeof(struct tzasc_cma_meta) * TZASC_NR, PAGE_SIZE << MAX_ORDER);
+	g_tzasc_cma_meta_arr = (struct tzasc_cma_meta *)__get_free_pages(GFP_KERNEL | __GFP_ZERO, MAX_ORDER);
+	if (g_tzasc_cma_meta_arr == NULL)
+		return -ENOMEM;
+	// g_tzasc_cma_meta->base = xxx_cma->base_pfn << PAGE_SHIFT;
+	for (cma_index = 0; cma_index < TZASC_NR; cma_index++) {
+		g_tzasc_cma_meta = g_tzasc_cma_meta_arr + cma_index;
+		g_tzasc_cma_meta->base = *(unsigned long *)tzasc_cma[cma_index] << PAGE_SHIFT;
+		g_tzasc_cma_meta->size = TZASC_PER_CMA_MEM_SIZE;
+		g_tzasc_cma_meta->count = 0;
+	}
+	return 0;
+}
+
+struct s2_l0_meta_entry {
+    unsigned long paddr;
+    unsigned long size;
+};
+
+struct s2_l0_meta {
+    unsigned long entry_nr;
+    struct s2_l0_meta_entry entry[0];
+};
+
+struct s2_l1_meta_entry {
+    unsigned long paddr;
+    unsigned long size;
+};
+
+#define LLM_MODEL_SIZE (8ul * 1024 * 1024 * 1024)
+
+static struct s2_l0_meta *g_s2_l0_meta;
+static struct s2_l1_meta_entry **g_s2_l1_meta_arr_s;
+static struct s2_l1_meta_entry **g_s2_l1_meta_arr_ns;
+static spinlock_t s2_lock;
+
+inline struct s2_l1_meta_entry *get_s2_l1_meta_entry(struct s2_l1_meta_entry **base, unsigned long index) {
+	for (unsigned long i = 0; i < g_s2_l0_meta->entry_nr; i++) {
+		if (index < (g_s2_l0_meta->entry[i].size / sizeof(struct s2_l1_meta_entry))) {
+			return &base[i][index];
+		}
+		index -= (g_s2_l0_meta->entry[i].size / sizeof(struct s2_l1_meta_entry));
+	}
+	return NULL;
+}
+
+int s2_alloc_pages(unsigned long entry_begin, unsigned long entry_end) {
+	int ret = 0;
+	unsigned long pages;
+	unsigned long order, page_nr;
+	struct s2_l1_meta_entry *entry;
+	unsigned long flags;
+
+    spin_lock_irqsave(&s2_lock, flags);
+
+	while (entry_begin < entry_end) {
+		for (order = MAX_ORDER; order >= 0; order--) {
+			page_nr = 1 << order;
+			if (entry_begin + page_nr > entry_end)
+				continue;
+			pages = __get_free_pages(GFP_KERNEL, order);
+			if (pages != 0)
+				break;
+		}
+		if (pages == 0) {
+			ret = -ENOMEM;
+			tloge("%s %d: ENOMEM\n", __func__, __LINE__);
+			goto out;
+		}
+		entry = get_s2_l1_meta_entry(g_s2_l1_meta_arr_s, entry_begin);
+		entry->paddr = virt_to_phys((const volatile void *)pages);
+		entry->size = page_nr << PAGE_SHIFT;
+
+		entry = get_s2_l1_meta_entry(g_s2_l1_meta_arr_ns, entry_begin);
+		entry->paddr = pages; // vaddr
+		entry->size = order; // order
+
+		entry_begin += page_nr;
+	}
+
+	if (entry_begin != entry_end) {
+		tloge("%s %d: begin %lu end %lu\n", __func__, __LINE__, entry_begin, entry_end);
+		ret = -EINVAL;
+	}
+
+    spin_unlock_irqrestore(&s2_lock, flags);
+
+out:
+	return ret;
+}
+
+int s2_free_pages(unsigned long entry_begin, unsigned long entry_end) {
+	int ret = 0;
+	struct s2_l1_meta_entry *entry;
+	unsigned long pages, order;
+	unsigned long flags;
+
+    spin_lock_irqsave(&s2_lock, flags);
+
+	while (entry_begin < entry_end) {
+		entry = get_s2_l1_meta_entry(g_s2_l1_meta_arr_ns, entry_begin);
+		pages = entry->paddr;
+		order = entry->size;
+		free_pages(pages, order);
+		entry->paddr = 0;
+		entry_begin += (1 << order);
+	}
+
+	if (entry_begin != entry_end) {
+		tloge("%s %d: begin %lu end %lu\n", __func__, __LINE__, entry_begin, entry_end);
+		ret = -EINVAL;
+	}
+
+    spin_unlock_irqrestore(&s2_lock, flags);
+
+	return ret;
+}
+
+void s2_free_all_pages(void) {
+	unsigned long flags;
+
+    spin_lock_irqsave(&s2_lock, flags);
+
+	unsigned long pages, order;
+	for (unsigned long i = 0; i < g_s2_l0_meta->entry_nr; i++) {
+		unsigned long entry_nr = (g_s2_l0_meta->entry[i].size / sizeof(struct s2_l1_meta_entry));
+		for (unsigned long index = 0; index < entry_nr; index++) {
+			struct s2_l1_meta_entry *entry = &g_s2_l1_meta_arr_ns[i][index];
+			pages = entry->paddr;
+			order = entry->size;
+			if (pages)
+				free_pages(pages, order);
+			entry->paddr = 0;
+		}
+	}
+
+    spin_unlock_irqrestore(&s2_lock, flags);
+}
+
+int s2_init(void) {
+	unsigned long l0_entry_nr = LLM_MODEL_SIZE / PAGE_SIZE / ((PAGE_SIZE << MAX_ORDER) / (sizeof(struct s2_l1_meta_entry))) + 1;
+	unsigned long i;
+
+	spin_lock_init(&s2_lock);
+
+	tlogd("%s %d: l0_entry_nr %lu\n", __func__, __LINE__, l0_entry_nr);
+
+	g_s2_l0_meta = (struct s2_l0_meta *)__get_free_page(GFP_KERNEL);
+	if (g_s2_l0_meta == NULL) {
+		return -ENOMEM;
+	}
+
+	g_s2_l0_meta->entry_nr = l0_entry_nr;
+	g_s2_l1_meta_arr_s = kmalloc(l0_entry_nr * sizeof(*g_s2_l1_meta_arr_s), GFP_KERNEL);
+	if (g_s2_l1_meta_arr_s == NULL) {
+		return -ENOMEM;
+	}
+	g_s2_l1_meta_arr_ns = vmalloc(l0_entry_nr * sizeof(*g_s2_l1_meta_arr_ns));
+	if (g_s2_l1_meta_arr_ns == NULL) {
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < l0_entry_nr; i++) {
+		g_s2_l1_meta_arr_s[i] = (struct s2_l1_meta_entry *)__get_free_pages(GFP_KERNEL | __GFP_ZERO, MAX_ORDER);
+		if (g_s2_l1_meta_arr_s[i] == NULL) {
+			return -ENOMEM;
+		}
+		g_s2_l1_meta_arr_ns[i] = (struct s2_l1_meta_entry *)vzalloc(PAGE_SIZE << MAX_ORDER);
+		if (g_s2_l1_meta_arr_ns[i] == NULL) {
+			return -ENOMEM;
+		}
+		g_s2_l0_meta->entry[i].paddr = virt_to_phys((const volatile void *)g_s2_l1_meta_arr_s[i]);
+		g_s2_l0_meta->entry[i].size = PAGE_SIZE << MAX_ORDER;
+	}
+
+	return 0;
+}
 
 static struct class *g_driver_class;
 static struct device_node *g_dev_node;
@@ -1070,6 +1387,374 @@ long tc_compat_private_ioctl(struct file *file, unsigned int cmd,
 }
 #endif
 
+#define NPU_CORE_NUM (3)
+
+static unsigned long waiting_npu_thread[2 << NPU_CORE_NUM];
+static void *rknpu_dev;
+
+void tzdriver_register_rknpu_dev(void *dev) {
+	tlogd("%s %d %p\n", __func__, __LINE__, dev);
+	rknpu_dev = dev;
+}
+EXPORT_SYMBOL(tzdriver_register_rknpu_dev);
+
+enum smc_loop_exit {
+	SMC_LOOP_EXIT_FINISH = 1,
+	SMC_LOOP_EXIT_NPU_SUBMIT,
+	SMC_LOOP_EXIT_NPU_DONE,
+	SMC_LOOP_EXIT_IO_STEP,
+};
+
+struct out_result {
+	enum smc_loop_exit exit;
+	union {
+		struct {
+
+		} finish;
+		struct {
+			int npu_mask;
+		} npu_submit;
+		struct {
+			void *job;
+		} npu_done;
+	};
+};
+
+extern void rknpu_job_done_s(struct rknpu_job *job, int ret);
+extern int rknpu_submit_s(struct rknpu_device *rknpu_dev, u32 core_mask);
+
+unsigned long on_fly_io_thread;
+
+unsigned long smc_call_cpu_resume(struct out_result *result) {
+	int ret;
+	int ret_tee = 0;
+	unsigned long req_thread = on_fly_io_thread;
+	on_fly_io_thread = 0;
+	while (true) {
+		struct smc_in_params in = { TSP_REQUEST, ret_tee, req_thread };
+		struct smc_out_params out;
+		// tlogd("%s %d cpu %d\n", __func__, __LINE__, raw_smp_processor_id());
+		do_smc_transport(&in, &out, 0);
+
+		// tlogd("%s %d ret %#lx\n", __func__, __LINE__, out.ret);
+		if (out.ret == SMC_EXIT_PREEMPTED) {
+			// tlogd("%s %d SMC_PREEMPT\n", __func__, __LINE__);
+			req_thread = 0;
+			ret_tee = 0;
+			cond_resched();
+		} else if (out.ret == SMC_EXIT_SHADOW) {
+			// tlogd("%s %d exit_reason %#lx\n", __func__, __LINE__, out.exit_reason);
+			// tlogd("%s %d target %#lx\n", __func__, __LINE__, out.target);
+			req_thread = out.target;
+			ret = 0;
+			switch (out.exit_reason) {
+			case 0xdeadbeef:
+				tzasc_cma_free_pages();
+				ret_tee = 0;
+				break;
+			case 4:
+				ret = SMC_LOOP_EXIT_IO_STEP;
+				on_fly_io_thread = req_thread;
+				break;
+			case 3:
+				result->npu_done.job = (void *)out.ta;
+				// tlogd("%s %d job %lx\n", __func__, __LINE__, out.ta);
+				rknpu_job_done_s(result->npu_done.job, 0);
+				ret_tee = 0;
+				break;
+			case 2:
+				result->npu_submit.npu_mask = out.ta;
+				waiting_npu_thread[result->npu_submit.npu_mask] = req_thread;
+				ret_tee = rknpu_submit_s(rknpu_dev, result->npu_submit.npu_mask);
+				req_thread = 0;
+				// return SMC_LOOP_EXIT_NPU_SUBMIT;
+				break;
+			case 1:
+				// tlogd("%s %d ta %#lx\n", __func__, __LINE__, out.ta);
+				ret_tee = tzasc_cma_push_pages_with_index(out.ta & ~(PAGE_SIZE-1), out.ta & (PAGE_SIZE-1));
+				break;
+			case 0:
+				ret_tee = tzasc_cma_pop_pages_with_index(out.ta & (PAGE_SIZE-1));
+				break;
+			default:
+				tloge("%s %d invalid exit_reason %ld ret %d\n", __func__, __LINE__, out.exit_reason, ret_tee);
+				ret_tee = -EINVAL;
+				break;
+			}
+			if (ret)
+				break;
+			cond_resched();
+		} else if (out.ret == SMC_EXIT_NORMAL) {
+			// return SMC_LOOP_EXIT_FINISH;
+		} else {
+			// tlogd("%s %d DONE\n", __func__, __LINE__);
+			// return out.ret;
+		}
+	}
+
+	return ret;
+}
+
+unsigned long smc_resume_npu_thread(int npu_core, void *job) {
+	int npu_mask = 1 << npu_core;
+	// tlogd("%s %d: resume core %d thread %lx job %lx\n", __func__, __LINE__, npu_core, waiting_npu_thread[npu_mask], (unsigned long)job);
+	struct smc_in_params in = { TSP_REQUEST, (unsigned long)job, waiting_npu_thread[npu_mask] };
+	struct smc_out_params out;
+	do_smc_transport(&in, &out, 0);
+	// tlogd("%s %d ret %d\n", __func__, __LINE__, out.ret);
+	return 0;
+}
+
+EXPORT_SYMBOL(smc_resume_npu_thread);
+
+static int llm_run(void __user * argp) {
+	
+	// tlogd("%s %d\n", __func__, __LINE__);
+	struct out_result result;
+	int copy_ret;
+	// while (true) smc_call_cpu_resume(&result);
+	unsigned long ret = smc_call_cpu_resume(&result);
+	switch (ret) {
+	case SMC_LOOP_EXIT_FINISH:
+		// tlogd("%s %d finish llm inference\n", __func__, __LINE__);
+		break;
+	case SMC_LOOP_EXIT_NPU_SUBMIT:
+		// tlogd("%s %d secure npu request core %d\n", __func__, __LINE__, result.npu_submit.npu_mask);
+		if (copy_to_user(argp, &result.npu_submit.npu_mask, sizeof(int))) {
+			tloge("copy llm npu core failed\n");
+			return -EFAULT;
+		}
+		break;
+	case SMC_LOOP_EXIT_IO_STEP:
+		copy_ret = (int)ret;
+		if (copy_to_user(argp, &copy_ret, sizeof(int))) {
+			// tloge("copy io step ret failed\n");
+			return -EFAULT;
+		}
+		break;
+	default:
+		// tloge("%s %d smc ret %d\n", __func__, __LINE__, ret);
+		break;
+	}
+
+	return 0;
+}
+
+/*
+
+struct mem_seg {
+	unsigned long entry_begin;
+	unsigned long entry_end;
+};
+
+static int llm_set_pages(struct file *file, void __user * argp) {
+	struct llm_client_op_pages op;
+	tlogd("%s %d\n", __func__, __LINE__);
+	if (copy_from_user(&op, argp, sizeof(op))) {
+		tloge("copy llm alloc_pages failed\n");
+		return -EFAULT;
+	}
+	struct mem_seg *seg = (struct mem_seg *)file->private_data;
+	seg->entry_begin = op.entry_begin;
+	seg->entry_end = op.entry_end;
+	return 0;
+}
+
+static int llm_alloc_pages(void __user * argp) {
+	struct llm_client_op_pages op;
+	tlogd("%s %d\n", __func__, __LINE__);
+	if (copy_from_user(&op, argp, sizeof(op))) {
+		tloge("copy llm alloc_pages failed\n");
+		return -EFAULT;
+	}
+	return s2_alloc_pages(op.entry_begin, op.entry_end);
+}
+
+static int llm_free_pages(void __user * argp) {
+	struct llm_client_op_pages op;
+	tlogd("%s %d\n", __func__, __LINE__);
+	if (copy_from_user(&op, argp, sizeof(op))) {
+		tloge("copy llm free_pages failed\n");
+		return -EFAULT;
+	}
+	return s2_free_pages(op.entry_begin, op.entry_end);
+}
+
+*/
+
+static int llm_set_pages(struct file *file, void __user * argp) {
+	struct llm_client_op_pages index;
+	if (copy_from_user(&index, argp, sizeof(struct llm_client_op_pages))) {
+		tloge("copy llm set_pages failed\n");
+		return -EFAULT;
+	}
+	struct llm_client_op_pages *index_p = (struct llm_client_op_pages *)file->private_data;
+	index_p->cma_index = index.cma_index;
+	index_p->entry_index = index.entry_index;
+	// tlogd("%s %d set index to %d\n", __func__, __LINE__, index);
+	return 0;
+}
+
+static int llm_push_pages(void __user * argp) {
+	struct llm_client_op_pages index;
+	// tlogd("%s %d\n", __func__, __LINE__);
+	if (copy_from_user(&index, argp, sizeof(index))) {
+		tloge("copy llm alloc_pages failed\n");
+		return -EFAULT;
+	}
+	index.entry_index = tzasc_cma_push_pages(index.size);
+	index.cma_index = cur_cma_index;
+	if (copy_to_user(argp, &index, sizeof(index))) {
+		tloge("copy llm alloc_pages failed\n");
+		return -EFAULT;
+	}
+	return 0;
+}
+
+static int llm_push_pages_with_index(void __user * argp) {
+	struct llm_client_op_pages index;
+	// tlogd("%s %d\n", __func__, __LINE__);
+	if (copy_from_user(&index, argp, sizeof(index))) {
+		tloge("copy llm alloc_pages failed\n");
+		return -EFAULT;
+	}
+	index.entry_index = tzasc_cma_push_pages_with_index(index.size, index.cma_index);
+	if (copy_to_user(argp, &index, sizeof(index))) {
+		tloge("copy llm alloc_pages failed\n");
+		return -EFAULT;
+	}
+	return 0;
+}
+
+static int llm_pop_pages(void __user * argp) {
+	struct llm_client_op_pages index;
+	// tlogd("%s %d\n", __func__, __LINE__);
+	return tzasc_cma_pop_pages();
+}
+
+extern int rknpu_init_test(void);
+extern void rknpu_exit_test(void);
+
+static int llm_test_attach(void __user * argp) {
+	(void)argp;
+	return rknpu_init_test();
+}
+
+static int llm_test_detach(void __user * argp) {
+	(void)argp;
+	rknpu_exit_test();
+	return 0;
+}
+
+static int llm_client_open(struct inode *inode, struct file *file) {
+	file->private_data = kmalloc(sizeof(struct llm_client_op_pages), GFP_KERNEL);
+	struct llm_client_op_pages *index_p = (struct llm_client_op_pages *)file->private_data;
+	index_p->cma_index = -1;
+	index_p->entry_index = -1;
+	// tlogd("111 %s %d\n", __func__, __LINE__);
+	return 0;
+}
+
+static int llm_client_close(struct inode *inode, struct file *file) {
+	kfree(file->private_data);
+	tzasc_cma_free_pages();
+	// tlogd("%s %d\n", __func__, __LINE__);
+	return 0;
+}
+
+static long llm_client_ioctl(struct file *file, unsigned int cmd,
+	unsigned long arg)
+{
+	int ret = -EFAULT;
+	void *argp = (void __user *)(uintptr_t)arg;
+
+	handle_cmd_prepare(cmd);
+	switch (cmd) {
+	case LLM_CLIENT_IOCTL_RUN:
+		// tlogd("%s %d\n", __func__, __LINE__);
+		ret = llm_run(argp);
+		// tlogd("%s %d: ret %d\n", __func__, __LINE__, ret);
+		break;
+	case LLM_CLIENT_IOCTL_PUSH_PAGES: {
+		ret = llm_push_pages(argp);
+		// tlogd("%s %d: ret %d\n", __func__, __LINE__, ret);
+		break;
+	}
+	case LLM_CLIENT_IOCTL_PUSH_PAGES_WITH_INDEX: {
+		ret = llm_push_pages_with_index(argp);
+		// tlogd("%s %d: ret %d\n", __func__, __LINE__, ret);
+		break;
+	}
+	case LLM_CLIENT_IOCTL_POP_PAGES: {
+		ret = llm_pop_pages(argp);
+		// tlogd("%s %d: ret %d\n", __func__, __LINE__, ret);
+		break;
+	}
+	case LLM_CLIENT_IOCTL_SET_PAGES: {
+		ret = llm_set_pages(file, argp);
+		// tlogd("%s %d: ret %d\n", __func__, __LINE__, ret);
+		break;
+	}
+	case LLM_CLIENT_IOCTL_RKNPU_ATTACH: {
+		ret = llm_test_attach(argp);
+		break;
+	}
+	case LLM_CLIENT_IOCTL_RKNPU_DETACH: {
+		ret = llm_test_detach(argp);
+		break;
+	}
+	default:
+		ret = -ENOSYS;
+	}
+
+	// tlogd("%s ret = 0x%x\n", __func__, ret);
+	return (long)ret;
+}
+
+static int llm_client_mmap(struct file *file, struct vm_area_struct *vma) {
+	unsigned long size = vma->vm_end - vma->vm_start;
+
+	unsigned long pfn;
+	struct llm_client_op_pages *index_p = (struct llm_client_op_pages *)file->private_data;
+	if (index_p->cma_index == -1) {
+		if (size > CMD_QUEUE_SHM_SIZE) {
+			tloge("%s %d try to mmap size=%lx\n", __func__, __LINE__, size);
+			return -EINVAL;
+		}
+		pfn = virt_to_phys((const volatile void *)g_llm_shm) >> PAGE_SHIFT;
+		if (remap_pfn_range(vma, vma->vm_start, pfn, size, vma->vm_page_prot)) {
+			tloge("%s %d\n", __func__, __LINE__);
+			printk(KERN_ERR "Failed to map memory\n");
+			return -EAGAIN;
+		}
+	} else {
+		if (index_p->cma_index < 0 || index_p->cma_index >= TZASC_NR)
+			return -EINVAL;
+		struct tzasc_cma_meta *g_tzasc_cma_meta = g_tzasc_cma_meta_arr + index_p->cma_index;
+		struct tzasc_cma_entry *entry = &g_tzasc_cma_meta->entry[index_p->entry_index];
+		if (size > entry->size) {
+			tloge("%s %d try to mmap size=%lx entry->size=%lx index=%d\n", __func__, __LINE__, size, entry->size, index_p->entry_index);
+			return -EINVAL;
+		}
+		pfn = page_to_phys(entry->cma_pages) >> PAGE_SHIFT;
+		if (remap_pfn_range(vma, vma->vm_start, pfn, size, vma->vm_page_prot)) {
+			tloge("%s %d\n", __func__, __LINE__);
+			printk(KERN_ERR "Failed to map memory\n");
+			return -EAGAIN;
+		}
+	}
+
+	return 0;
+}
+
+static const struct file_operations g_llm_ns_client_fops = {
+	.owner = THIS_MODULE,
+	.open = llm_client_open,
+	.release = llm_client_close,
+	.unlocked_ioctl = llm_client_ioctl,
+	.mmap = llm_client_mmap,
+};
+
 static const struct file_operations g_tc_ns_client_fops = {
 	.owner = THIS_MODULE,
 	.open = tc_client_open,
@@ -1249,6 +1934,78 @@ static int enable_dev_nodes(void)
 	return 0;
 }
 
+static int llm_client_init(void)
+{
+	tlogd("%s %d\n", __func__, __LINE__);
+	int ret = 0;
+
+	g_driver_class = class_create(THIS_MODULE, TC_NS_CLIENT_DEV);
+	if (IS_ERR_OR_NULL(g_driver_class)) {
+		tloge("class create failed");
+		return -ENOMEM;
+	}
+
+	ret = init_dev_node(&g_tc_client, TC_NS_CLIENT_DEV, g_driver_class, &g_llm_ns_client_fops);
+	if (ret != 0) {
+		tloge("init_dev_node failed");
+		return ret;
+	}
+
+	ret = cdev_add(&(g_tc_client.char_dev),
+		MKDEV(MAJOR(g_tc_client.devt), 0), 1);
+	if (ret < 0) {
+		tloge("cdev add failed %d", ret);
+		return ret;
+	}
+
+	return 0;
+}
+
+static int llm_tee_os_init(void)
+{
+	tlogd("%s %d\n", __func__, __LINE__);
+	int ret;
+	g_llm_shm = __get_free_pages(GFP_KERNEL | __GFP_ZERO, 8);
+	if (g_llm_shm == 0) {
+		return -ENOMEM;
+	} else {
+		ret = 0;
+	}
+
+	ret = s2_init();
+	if (ret < 0) {
+		return -ENOMEM;
+	}
+
+	ret = tzasc_cma_init();
+	if (ret < 0) {
+		return ret;
+	}
+
+	while (true) {
+		struct smc_in_params in = {
+			.x0 = TSP_REQUEST,
+			.x1 = virt_to_phys((const volatile void *)g_llm_shm),
+			.x2 = CMD_QUEUE_SHM_SIZE,
+			.x3 = virt_to_phys((const volatile void *)g_s2_l0_meta),
+			.x4 = virt_to_phys((const volatile void *)g_tzasc_cma_meta_arr),
+		};
+		struct smc_out_params out;
+		do_smc_transport(&in, &out, 0);
+
+		if (out.ret == SMC_EXIT_PREEMPTED) {
+			cond_resched();
+		} else {
+			tlogd("%s %d shm init DONE\n", __func__, __LINE__);
+			break;
+		}
+	}
+
+	// tlogd("test %lu\n", get_s2_l1_meta_entry(g_s2_l1_meta_arr_s, 600000)->size);
+
+	return ret;
+}
+
 static int tc_ns_client_init(void)
 {
 	int ret;
@@ -1320,11 +2077,11 @@ static int tc_teeos_init(struct device *class_dev)
 		goto release_resmem;
 	}
 
-	ret = tz_spi_init(class_dev, g_dev_node);
-	if (ret != 0) {
-		tloge("tz spi init failed\n");
-		goto release_mempool;
-	}
+	// ret = tz_spi_init(class_dev, g_dev_node);
+	// if (ret != 0) {
+	// 	tloge("tz spi init failed\n");
+	// 	goto release_mempool;
+	// }
 
 	return 0;
 release_mempool:
@@ -1388,6 +2145,15 @@ static void tc_re_init(const struct device *class_dev)
 static __init int tc_init(void)
 {
 	int ret = 0;
+
+	ret = llm_tee_os_init();
+	if (ret != 0)
+		return ret;
+	ret = llm_client_init();
+	if (ret != 0)
+		return ret;
+	tlogd("%s %d: tc_init finish\n", __func__, __LINE__);
+	return ret;
 
 	init_kthread_cpumask();
 	ret = tc_ns_client_init();

@@ -33,6 +33,25 @@ enum tc_ns_cmd_type {
 	TC_NS_CMD_TYPE_MAX
 };
 
+enum smc_ops_exit {
+	SMC_OPS_NORMAL   	= 0x0,
+	SMC_OPS_SCHEDTO     	= 0x1,
+	SMC_OPS_START_SHADOW	= 0x2,
+	SMC_OPS_START_FIQSHD	= 0x3,
+	SMC_OPS_PROBE_ALIVE	= 0x4,
+	SMC_OPS_ABORT_TASK	= 0x5,
+	SMC_EXIT_NORMAL		= 0x0,
+	SMC_EXIT_PREEMPTED	= 0x1,
+	SMC_EXIT_SHADOW		= 0x2,
+	SMC_EXIT_ABORT		= 0x3,
+#ifdef CONFIG_THIRDPARTY_COMPATIBLE
+	SMC_EXIT_CRASH          = 0x4,
+	SMC_EXIT_MAX            = 0x5,
+#else
+	SMC_EXIT_MAX		= 0x4,
+#endif
+};
+
 struct pending_entry {
 	atomic_t users;
 	struct task_struct *task;
